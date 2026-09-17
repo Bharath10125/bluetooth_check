@@ -13,110 +13,231 @@ import {
   View,
 } from "react-native";
 
-import RNBluetoothClassic from "react-native-bluetooth-classic";
+import {
+  BleManager,
+  Device
+} from "react-native-ble-plx";
 
-type BluetoothDevice = {
-  id: string;
-  name: string;
-  address?: string;
-  bonded?: boolean;
-};
+import { Buffer } from "buffer";
+
+// --------------------------------------------------
+// BLE CONFIGURATION
+// --------------------------------------------------
+
+const SERVICE_UUID =
+  "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+
+const CHARACTERISTIC_UUID =
+  "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+
+const DEVICE_NAME = "ESP32-C3-Stepper";
 
 const CONNECT_TIMEOUT_MS = 15000;
+
+// Commands the firmware understands
+type Command = "START" | "STOP" | "PING";
+
+// --------------------------------------------------
+// BLE MANAGER
+// --------------------------------------------------
+
+const bleManager = new BleManager();
 
 export default function HomeScreen() {
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(false);
+  const [scanning, setScanning] = useState(false);
 
-  const [device, setDevice] = useState<BluetoothDevice | null>(null);
-  const [devices, setDevices] = useState<BluetoothDevice[]>([]);
+  const [device, setDevice] = useState<Device | null>(null);
 
   const [lastMessage, setLastMessage] = useState("Waiting...");
-  const [pingCount, setPingCount] = useState(0);
+  const [lastSent, setLastSent] = useState("-");
 
-  // Keep a ref mirror of `device` so the read listener always sees the
-  // freshest connection without needing to be re-subscribed unnecessarily.
-  const deviceRef = useRef<BluetoothDevice | null>(null);
+  const [motorRunning, setMotorRunning] = useState(false);
+  const [sending, setSending] = useState(false);
 
-  /*
-   * ------------------------------------------------
-   * PERMISSIONS (Android 12+ requires runtime grants)
-   * ------------------------------------------------
-   */
+  const [foundDevices, setFoundDevices] = useState<Device[]>([]);
+
+  const deviceRef = useRef<Device | null>(null);
+
+  // --------------------------------------------------
+  // ANDROID BLE PERMISSIONS
+  // --------------------------------------------------
 
   const requestBluetoothPermissions = async (): Promise<boolean> => {
     if (Platform.OS !== "android") {
       return true;
     }
 
-    // Permissions were introduced at API 31 (Android 12).
-    if (Platform.Version < 31) {
-      return true;
-    }
-
     try {
-      const granted = await PermissionsAndroid.requestMultiple([
-        PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
-        PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
-      ]);
+      if (Platform.Version >= 31) {
+        const result = await PermissionsAndroid.requestMultiple([
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+        ]);
 
-      const allGranted = Object.values(granted).every(
-        (status) => status === PermissionsAndroid.RESULTS.GRANTED
-      );
-
-      if (!allGranted) {
-        Alert.alert(
-          "Permissions Required",
-          "Bluetooth permissions are needed to find and connect to HC-05. Please grant them in your device settings."
+        return (
+          result[PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN] ===
+            PermissionsAndroid.RESULTS.GRANTED &&
+          result[PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT] ===
+            PermissionsAndroid.RESULTS.GRANTED
         );
       }
 
-      return allGranted;
+      // Android 11 and below
+      const result = await PermissionsAndroid.request(
+        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
+      );
+
+      return result === PermissionsAndroid.RESULTS.GRANTED;
     } catch (error) {
-      console.error("Permission request failed:", error);
+      console.error("BLE permission error:", error);
+
+      Alert.alert(
+        "Permission Error",
+        "Bluetooth permissions could not be granted."
+      );
+
       return false;
     }
   };
 
-  /*
-   * ------------------------------------------------
-   * GET PAIRED BLUETOOTH DEVICES
-   * ------------------------------------------------
-   */
+  // --------------------------------------------------
+  // CHECK BLUETOOTH STATE
+  // --------------------------------------------------
 
-  const getBluetoothDevices = async (silent = false) => {
+  const checkBluetoothState = async (): Promise<boolean> => {
+    const state = await bleManager.state();
+
+    console.log("Bluetooth state:", state);
+
+    if (state !== "PoweredOn") {
+      Alert.alert(
+        "Bluetooth Disabled",
+        "Please enable Bluetooth on your phone."
+      );
+
+      return false;
+    }
+
+    return true;
+  };
+
+  // --------------------------------------------------
+  // SCAN FOR ESP32
+  // --------------------------------------------------
+
+  const scanForESP32 = async () => {
+    if (scanning) {
+      return;
+    }
+
     try {
-      const bondedDevices = await RNBluetoothClassic.getBondedDevices();
+      const hasPermissions = await requestBluetoothPermissions();
 
-      console.log("Paired Bluetooth devices:", bondedDevices);
-
-      setDevices(bondedDevices);
-
-      return bondedDevices;
-    } catch (error) {
-      console.error("Failed to get Bluetooth devices:", error);
-
-      // Don't alert during silent/background checks (e.g. on mount before
-      // the user has taken any action) — only surface this for
-      // user-initiated calls.
-      if (!silent) {
-        Alert.alert(
-          "Bluetooth Error",
-          "Could not get paired Bluetooth devices."
-        );
+      if (!hasPermissions) {
+        return;
       }
 
-      return [];
+      const bluetoothReady = await checkBluetoothState();
+
+      if (!bluetoothReady) {
+        return;
+      }
+
+      console.log("Starting BLE scan...");
+
+      setScanning(true);
+      setFoundDevices([]);
+
+      bleManager.stopDeviceScan();
+
+      bleManager.startDeviceScan(
+        [SERVICE_UUID],
+        {
+          allowDuplicates: false,
+        },
+        (error, scannedDevice) => {
+          if (error) {
+            console.error("BLE scan error:", error);
+
+            setScanning(false);
+
+            Alert.alert(
+              "BLE Scan Error",
+              error.message || "Could not scan for BLE devices."
+            );
+
+            return;
+          }
+
+          if (!scannedDevice) {
+            return;
+          }
+
+          console.log(
+            "BLE device:",
+            scannedDevice.name,
+            scannedDevice.id
+          );
+
+          // Only accept our ESP32
+          const matchesName =
+            scannedDevice.name === DEVICE_NAME ||
+            scannedDevice.localName === DEVICE_NAME;
+
+          const matchesService =
+            scannedDevice.serviceUUIDs?.some(
+              (uuid) =>
+                uuid.toLowerCase() === SERVICE_UUID.toLowerCase()
+            );
+
+          if (matchesName || matchesService) {
+            console.log(
+              "ESP32 FOUND:",
+              scannedDevice.name,
+              scannedDevice.id
+            );
+
+            setFoundDevices((current) => {
+              const alreadyExists = current.some(
+                (item) => item.id === scannedDevice.id
+              );
+
+              if (alreadyExists) {
+                return current;
+              }
+
+              return [...current, scannedDevice];
+            });
+          }
+        }
+      );
+
+      // Stop scan after 10 seconds
+      setTimeout(() => {
+        bleManager.stopDeviceScan();
+        setScanning(false);
+
+        console.log("BLE scan stopped");
+      }, 10000);
+    } catch (error) {
+      console.error("Scan failed:", error);
+
+      setScanning(false);
+
+      Alert.alert(
+        "BLE Error",
+        "Could not start BLE scanning."
+      );
     }
   };
 
-  /*
-   * ------------------------------------------------
-   * CONNECT TO HC-05
-   * ------------------------------------------------
-   */
+  // --------------------------------------------------
+  // CONNECT TO ESP32
+  // --------------------------------------------------
 
-  const connectToHC05 = async () => {
+  const connectToESP32 = async (selectedDevice: Device) => {
     if (connecting) {
       return;
     }
@@ -124,79 +245,30 @@ export default function HomeScreen() {
     try {
       setConnecting(true);
 
-      const hasPermissions = await requestBluetoothPermissions();
+      bleManager.stopDeviceScan();
+      setScanning(false);
 
-      if (!hasPermissions) {
-        setConnecting(false);
-        return;
-      }
-
-      /*
-       * Make sure Bluetooth is enabled
-       */
-
-      const enabled = await RNBluetoothClassic.isBluetoothEnabled();
-
-      console.log("Bluetooth enabled:", enabled);
-
-      if (!enabled) {
-        Alert.alert(
-          "Bluetooth Disabled",
-          "Please enable Bluetooth on your phone."
-        );
-
-        setConnecting(false);
-
-        return;
-      }
-
-      /*
-       * Get paired devices
-       */
-
-      const bondedDevices = await getBluetoothDevices();
-
-      console.log("Available paired devices:", bondedDevices);
-
-      /*
-       * Find HC-05
-       */
-
-      const hc05 = bondedDevices.find((item: BluetoothDevice) =>
-        item.name?.toUpperCase().includes("HC-05")
+      console.log(
+        "Connecting to:",
+        selectedDevice.name,
+        selectedDevice.id
       );
 
-      /*
-       * HC-05 not found
-       */
+      // ----------------------------------------------
+      // CONNECT
+      // ----------------------------------------------
 
-      if (!hc05) {
-        Alert.alert(
-          "HC-05 Not Found",
-          "Please pair HC-05 with your phone first from Android Bluetooth settings."
-        );
-
-        setConnecting(false);
-
-        return;
-      }
-
-      console.log("HC-05 found:", hc05);
-
-      /*
-       * REAL BLUETOOTH CONNECTION (with a manual timeout, since classic
-       * connect() can hang indefinitely if the device is unresponsive)
-       */
-
-      const connectPromise = RNBluetoothClassic.connectToDevice(hc05.id, {
-        DELIMITER: "\n",
-      });
+      const connectPromise = bleManager.connectToDevice(
+        selectedDevice.id,
+        {
+          timeout: CONNECT_TIMEOUT_MS,
+        }
+      );
 
       const timeoutPromise = new Promise<never>((_, reject) => {
-        setTimeout(
-          () => reject(new Error("Connection timed out")),
-          CONNECT_TIMEOUT_MS
-        );
+        setTimeout(() => {
+          reject(new Error("Connection timed out"));
+        }, CONNECT_TIMEOUT_MS);
       });
 
       const connectedDevice = await Promise.race([
@@ -204,337 +276,557 @@ export default function HomeScreen() {
         timeoutPromise,
       ]);
 
-      console.log("Bluetooth connected:", connectedDevice);
+      console.log(
+        "BLE connected:",
+        connectedDevice.name,
+        connectedDevice.id
+      );
 
-      /*
-       * Save connected device
-       */
+      // ----------------------------------------------
+      // DISCOVER SERVICES + CHARACTERISTICS
+      // ----------------------------------------------
 
-      setDevice(connectedDevice as BluetoothDevice);
-      deviceRef.current = connectedDevice as BluetoothDevice;
+      const discoveredDevice =
+        await connectedDevice.discoverAllServicesAndCharacteristics();
+
+      console.log("BLE services discovered");
+
+      // ----------------------------------------------
+      // VERIFY OUR CHARACTERISTIC
+      // ----------------------------------------------
+
+      const services = await discoveredDevice.services();
+
+      const service = services.find(
+        (item) =>
+          item.uuid.toLowerCase() === SERVICE_UUID.toLowerCase()
+      );
+
+      if (!service) {
+        throw new Error(
+          "ESP32 service was not found."
+        );
+      }
+
+      const characteristics =
+        await service.characteristics();
+
+      const characteristic = characteristics.find(
+        (item) =>
+          item.uuid.toLowerCase() ===
+          CHARACTERISTIC_UUID.toLowerCase()
+      );
+
+      if (!characteristic) {
+        throw new Error(
+          "ESP32 characteristic was not found."
+        );
+      }
+
+      console.log(
+        "BLE characteristic found:",
+        characteristic.uuid
+      );
+
+      // ----------------------------------------------
+      // SAVE CONNECTION
+      // ----------------------------------------------
+
+      setDevice(discoveredDevice);
+
+      deviceRef.current = discoveredDevice;
 
       setConnected(true);
 
       setLastMessage("Connected");
+      setLastSent("-");
+      setMotorRunning(false);
+
+      // ----------------------------------------------
+      // LISTEN FOR ESP32 NOTIFICATIONS
+      // ----------------------------------------------
+
+      if (characteristic.isNotifiable) {
+        console.log("Starting BLE notification listener...");
+
+        discoveredDevice.monitorCharacteristicForService(
+          SERVICE_UUID,
+          CHARACTERISTIC_UUID,
+          (error, updatedCharacteristic) => {
+            if (error) {
+              console.error(
+                "BLE notification error:",
+                error
+              );
+
+              return;
+            }
+
+            if (!updatedCharacteristic?.value) {
+              return;
+            }
+
+            try {
+              const message = Buffer.from(
+                updatedCharacteristic.value,
+                "base64"
+              ).toString("utf8");
+
+              console.log("BLE RX:", message);
+
+              const cleanMessage = message.trim();
+
+              if (!cleanMessage) {
+                return;
+              }
+
+              setLastMessage(cleanMessage);
+
+              // Motor state comes from the ESP32, not the button press
+              const upper = cleanMessage.toUpperCase();
+
+              if (upper === "MOTOR STARTED") {
+                setMotorRunning(true);
+              } else if (upper === "MOTOR STOPPED") {
+                setMotorRunning(false);
+              }
+            } catch (error) {
+              console.error(
+                "Failed to decode BLE data:",
+                error
+              );
+            }
+          }
+        );
+      }
+
+      Alert.alert(
+        "Connected",
+        `${DEVICE_NAME}\n${discoveredDevice.id}`
+      );
     } catch (error) {
-      console.error("HC-05 connection failed:", error);
+      console.error(
+        "ESP32 BLE connection failed:",
+        error
+      );
 
       setConnected(false);
       setDevice(null);
+      setMotorRunning(false);
       deviceRef.current = null;
 
       const message =
-        error instanceof Error && error.message === "Connection timed out"
-          ? "Connection to HC-05 timed out. Make sure it's powered on and in range."
-          : "Could not connect to HC-05.";
+        error instanceof Error
+          ? error.message
+          : "Could not connect to ESP32.";
 
-      Alert.alert("Connection Failed", message);
+      Alert.alert(
+        "Connection Failed",
+        message
+      );
     } finally {
       setConnecting(false);
     }
   };
 
-  /*
-   * ------------------------------------------------
-   * DISCONNECT
-   * ------------------------------------------------
-   */
+  // --------------------------------------------------
+  // DISCONNECT
+  // --------------------------------------------------
 
   const disconnectBluetooth = async () => {
     try {
-      if (device) {
-        await RNBluetoothClassic.disconnectFromDevice(device.id);
+      bleManager.stopDeviceScan();
+
+      if (deviceRef.current) {
+        // Leave the motor in a safe state before dropping the link
+        try {
+          await deviceRef.current.writeCharacteristicWithResponseForService(
+            SERVICE_UUID,
+            CHARACTERISTIC_UUID,
+            Buffer.from("STOP").toString("base64")
+          );
+        } catch (error) {
+          console.warn("Could not send STOP before disconnect:", error);
+        }
+
+        await bleManager.cancelDeviceConnection(
+          deviceRef.current.id
+        );
       }
 
       setConnected(false);
       setDevice(null);
+      setMotorRunning(false);
+
       deviceRef.current = null;
 
       setLastMessage("Disconnected");
-    } catch (error) {
-      console.error("Disconnect error:", error);
 
-      /*
-       * Reset UI anyway
-       */
+      console.log("BLE disconnected");
+    } catch (error) {
+      console.error(
+        "BLE disconnect error:",
+        error
+      );
 
       setConnected(false);
       setDevice(null);
+      setMotorRunning(false);
+
       deviceRef.current = null;
     }
   };
 
-  /*
-   * ------------------------------------------------
-   * SEND PING
-   * ------------------------------------------------
-   */
+  // --------------------------------------------------
+  // SEND COMMAND (START / STOP / PING)
+  // --------------------------------------------------
 
-  const sendPing = async () => {
+  const sendCommand = async (command: Command) => {
     if (!connected || !device) {
-      Alert.alert("Not Connected", "Connect to HC-05 first.");
+      Alert.alert(
+        "Not Connected",
+        "Connect to ESP32 first."
+      );
+
+      return;
+    }
+
+    if (sending) {
       return;
     }
 
     try {
-      console.log("TX: PING");
+      setSending(true);
 
-      /*
-       * Arduino expects:
-       *
-       * PING\n
-       */
+      console.log("BLE TX:", command);
 
-      await RNBluetoothClassic.writeToDevice(device.id, "PING\n");
+      // Convert ASCII -> Base64
+      const data = Buffer.from(command).toString("base64");
 
-      /*
-       * Update UI
-       */
+      await device.writeCharacteristicWithResponseForService(
+        SERVICE_UUID,
+        CHARACTERISTIC_UUID,
+        data
+      );
 
-      setPingCount((count) => count + 1);
-
-      setLastMessage("PING");
+      setLastSent(command);
     } catch (error) {
-      console.error("PING failed:", error);
+      console.error(`${command} failed:`, error);
 
-      Alert.alert("Bluetooth Error", "Failed to send PING.");
+      Alert.alert(
+        "BLE Error",
+        `Could not send ${command}. Check the connection and try again.`
+      );
+    } finally {
+      setSending(false);
     }
   };
 
-  /*
-   * ------------------------------------------------
-   * RECEIVE DATA FROM ARDUINO
-   * ------------------------------------------------
-   */
-
-  useEffect(() => {
-    if (!device) {
-      return;
-    }
-
-    console.log("Starting Bluetooth listener for:", device.id);
-
-    let subscription: { remove?: () => void } | undefined;
-
-    try {
-      subscription = RNBluetoothClassic.onDeviceRead(
-        device.id,
-        (event: any) => {
-          console.log("RX:", event);
-
-          const message = event?.data ?? "";
-
-          const cleanMessage = String(message).trim();
-
-          if (!cleanMessage) {
-            return;
-          }
-
-          console.log("Arduino message:", cleanMessage);
-
-          setLastMessage(cleanMessage);
-        }
-      );
-    } catch (error) {
-      console.error("Failed to start Bluetooth listener:", error);
-    }
-
-    return () => {
-      console.log("Removing Bluetooth listener");
-
-      subscription?.remove?.();
-    };
-  }, [device]);
-
-  /*
-   * ------------------------------------------------
-   * INITIAL BLUETOOTH CHECK
-   * ------------------------------------------------
-   */
-
-  useEffect(() => {
-    const initializeBluetooth = async () => {
-      try {
-        if (Platform.OS === "android" && Platform.Version >= 31) {
-          const alreadyGranted =
-            (await PermissionsAndroid.check(
-              PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT
-            )) &&
-            (await PermissionsAndroid.check(
-              PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN
-            ));
-
-          if (!alreadyGranted) {
-            // Don't prompt or alert on cold start — just skip the silent
-            // pre-fetch and let the user trigger the permission request
-            // via the Connect button.
-            return;
-          }
-        }
-
-        const enabled = await RNBluetoothClassic.isBluetoothEnabled();
-
-        console.log("Bluetooth enabled:", enabled);
-
-        if (enabled) {
-          await getBluetoothDevices(true);
-        }
-      } catch (error) {
-        console.error("Bluetooth initialization error:", error);
-      }
-    };
-
-    initializeBluetooth();
-  }, []);
-
-  /*
-   * ------------------------------------------------
-   * CLEAN UP CONNECTION ON UNMOUNT
-   * ------------------------------------------------
-   */
+  // --------------------------------------------------
+  // CLEANUP
+  // --------------------------------------------------
 
   useEffect(() => {
     return () => {
+      bleManager.stopDeviceScan();
+
       if (deviceRef.current) {
-        RNBluetoothClassic.disconnectFromDevice(deviceRef.current.id).catch(
-          (error) => console.error("Unmount disconnect error:", error)
-        );
+        bleManager
+          .cancelDeviceConnection(
+            deviceRef.current.id
+          )
+          .catch((error) =>
+            console.error(
+              "Cleanup disconnect error:",
+              error
+            )
+          );
       }
     };
   }, []);
 
-  /*
-   * ------------------------------------------------
-   * UI
-   * ------------------------------------------------
-   */
+  // --------------------------------------------------
+  // UI
+  // --------------------------------------------------
+
+  const controlsDisabled = !connected || sending;
 
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="dark-content" />
 
       <ScrollView showsVerticalScrollIndicator={false}>
+
         {/* HEADER */}
 
         <View style={styles.header}>
-          <Text style={styles.title}>Bluetooth Ping Pong</Text>
+          <Text style={styles.title}>
+            ESP32 BLE Control
+          </Text>
 
           <View style={styles.statusContainer}>
             <View
               style={[
                 styles.statusDot,
-                connected ? styles.connected : styles.disconnected,
+                connected
+                  ? styles.connected
+                  : styles.disconnected,
               ]}
             />
 
             <Text style={styles.statusText}>
-              {connected ? "Connected" : "Disconnected"}
+              {connected
+                ? "Connected"
+                : "Disconnected"}
             </Text>
           </View>
         </View>
 
-        {/* HC-05 CARD */}
+        {/* BLE DEVICE CARD */}
 
         <View style={styles.card}>
-          <Text style={styles.cardTitle}>HC-05</Text>
+
+          <Text style={styles.cardTitle}>
+            ESP32-C3
+          </Text>
 
           <Text style={styles.deviceText}>
-            {device ? device.name : "No device connected"}
+            {device
+              ? device.name ||
+                DEVICE_NAME
+              : DEVICE_NAME}
           </Text>
 
           {device && (
-            <Text style={styles.address}>Address: {device.id}</Text>
+            <Text style={styles.address}>
+              BLE ID: {device.id}
+            </Text>
           )}
 
           <TouchableOpacity
             style={[
               styles.connectButton,
-              connected && styles.disconnectButton,
+              connected &&
+                styles.disconnectButton,
             ]}
-            onPress={connected ? disconnectBluetooth : connectToHC05}
-            disabled={connecting}
+            onPress={
+              connected
+                ? disconnectBluetooth
+                : scanForESP32
+            }
+            disabled={
+              connecting ||
+              scanning
+            }
           >
-            {connecting ? (
-              <View style={styles.loadingContainer}>
-                <ActivityIndicator color="#FFFFFF" />
 
-                <Text style={[styles.buttonText, styles.loadingText]}>
-                  Connecting...
+            {connecting ||
+            scanning ? (
+              <View style={styles.loadingContainer}>
+
+                <ActivityIndicator
+                  color="#FFFFFF"
+                />
+
+                <Text
+                  style={[
+                    styles.buttonText,
+                    styles.loadingText,
+                  ]}
+                >
+                  {connecting
+                    ? "Connecting..."
+                    : "Scanning..."}
                 </Text>
+
               </View>
             ) : (
               <Text style={styles.buttonText}>
-                {connected ? "Disconnect" : "Connect HC-05"}
+                {connected
+                  ? "Disconnect"
+                  : "Scan for ESP32"}
               </Text>
             )}
+
           </TouchableOpacity>
+        </View>
+
+        {/* FOUND DEVICES */}
+
+        {foundDevices.length > 0 && (
+          <View style={styles.card}>
+
+            <Text style={styles.cardTitle}>
+              BLE Devices Found
+            </Text>
+
+            {foundDevices.map((item) => (
+              <TouchableOpacity
+                key={item.id}
+                style={styles.deviceRow}
+                onPress={() =>
+                  connectToESP32(item)
+                }
+                disabled={connecting}
+              >
+
+                <View style={styles.deviceInfo}>
+
+                  <Text style={styles.deviceName}>
+                    {item.name ||
+                      item.localName ||
+                      "Unknown BLE Device"}
+                  </Text>
+
+                  <Text
+                    style={styles.deviceAddress}
+                  >
+                    {item.id}
+                  </Text>
+
+                </View>
+
+                <Text style={styles.paired}>
+                  CONNECT
+                </Text>
+
+              </TouchableOpacity>
+            ))}
+
+          </View>
+        )}
+
+        {/* MOTOR CARD */}
+
+        <View style={styles.motorCard}>
+
+          <Text style={styles.cardTitle}>
+            Stepper Motor
+          </Text>
+
+          <View style={styles.motorStateRow}>
+            <View
+              style={[
+                styles.statusDot,
+                motorRunning
+                  ? styles.running
+                  : styles.stopped,
+              ]}
+            />
+
+            <Text style={styles.motorStateText}>
+              {motorRunning ? "Running" : "Stopped"}
+            </Text>
+          </View>
+
+          <View style={styles.controlRow}>
+
+            <TouchableOpacity
+              style={[
+                styles.controlButton,
+                styles.startButton,
+                (controlsDisabled || motorRunning) &&
+                  styles.disabledButton,
+              ]}
+              onPress={() => sendCommand("START")}
+              disabled={controlsDisabled || motorRunning}
+            >
+              <Text style={styles.controlButtonText}>
+                Start motor
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[
+                styles.controlButton,
+                styles.stopButton,
+                (controlsDisabled || !motorRunning) &&
+                  styles.disabledButton,
+              ]}
+              onPress={() => sendCommand("STOP")}
+              disabled={controlsDisabled || !motorRunning}
+            >
+              <Text style={styles.controlButtonText}>
+                Stop motor
+              </Text>
+            </TouchableOpacity>
+
+          </View>
+
+          <Text style={styles.hint}>
+            {connected
+              ? "State updates when the ESP32 confirms the command."
+              : "Connect to the ESP32 to control the motor."}
+          </Text>
+
         </View>
 
         {/* PING CARD */}
 
         <View style={styles.pingCard}>
-          <Text style={styles.cardTitle}>Ping Pong</Text>
 
-          <Text style={styles.messageLabel}>Last Message</Text>
+          <Text style={styles.cardTitle}>
+            BLE Ping Pong
+          </Text>
 
-          <Text style={styles.message}>{lastMessage}</Text>
+          <Text style={styles.messageLabel}>
+            Last Message
+          </Text>
+
+          <Text style={styles.message}>
+            {lastMessage}
+          </Text>
 
           <TouchableOpacity
-            style={[styles.pingButton, !connected && styles.disabledButton]}
-            onPress={sendPing}
-            disabled={!connected}
+            style={[
+              styles.pingButton,
+              controlsDisabled &&
+                styles.disabledButton,
+            ]}
+            onPress={() => sendCommand("PING")}
+            disabled={controlsDisabled}
           >
-            <Text style={styles.pingButtonText}>PING</Text>
+            <Text style={styles.pingButtonText}>
+              PING
+            </Text>
           </TouchableOpacity>
 
-          <Text style={styles.counter}>Ping Count: {pingCount}</Text>
-        </View>
-
-        {/* PAIRED DEVICES */}
-
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>Paired Devices</Text>
-
-          {devices.length === 0 ? (
-            <Text style={styles.deviceText}>No paired Bluetooth devices</Text>
-          ) : (
-            devices.map((item: BluetoothDevice) => (
-              <View key={item.id} style={styles.deviceRow}>
-                <View style={styles.deviceInfo}>
-                  <Text style={styles.deviceName}>
-                    {item.name || "Unknown Device"}
-                  </Text>
-
-                  <Text style={styles.deviceAddress}>{item.id}</Text>
-                </View>
-
-                <Text style={styles.paired}>Paired</Text>
-              </View>
-            ))
-          )}
         </View>
 
         {/* COMMUNICATION LOG */}
 
         <View style={styles.logCard}>
-          <Text style={styles.cardTitle}>Communication</Text>
+
+          <Text style={styles.cardTitle}>
+            BLE Communication
+          </Text>
 
           <View style={styles.logRow}>
-            <Text style={styles.logLabel}>TX</Text>
+
+            <Text style={styles.logLabel}>
+              TX
+            </Text>
 
             <Text style={styles.logValue}>
-              {pingCount > 0 ? "PING" : "-"}
+              {lastSent}
             </Text>
+
           </View>
 
           <View style={styles.logRow}>
-            <Text style={styles.logLabel}>RX</Text>
+
+            <Text style={styles.logLabel}>
+              RX
+            </Text>
 
             <Text style={styles.logValue}>
-              {lastMessage.includes("PONG") ? "PONG" : "-"}
+              {lastMessage}
             </Text>
+
           </View>
+
         </View>
+
       </ScrollView>
     </SafeAreaView>
   );
@@ -585,6 +877,14 @@ const styles = StyleSheet.create({
     backgroundColor: "#EF4444",
   },
 
+  running: {
+    backgroundColor: "#22C55E",
+  },
+
+  stopped: {
+    backgroundColor: "#9CA3AF",
+  },
+
   statusText: {
     fontSize: 14,
     color: "#6B7280",
@@ -595,6 +895,57 @@ const styles = StyleSheet.create({
     borderRadius: 18,
     padding: 20,
     marginBottom: 15,
+  },
+
+  motorCard: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 18,
+    padding: 20,
+    marginBottom: 15,
+  },
+
+  motorStateRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 18,
+  },
+
+  motorStateText: {
+    fontSize: 15,
+    fontWeight: "600",
+    color: "#111827",
+  },
+
+  controlRow: {
+    flexDirection: "row",
+    gap: 12,
+  },
+
+  controlButton: {
+    flex: 1,
+    paddingVertical: 16,
+    borderRadius: 12,
+    alignItems: "center",
+  },
+
+  startButton: {
+    backgroundColor: "#16A34A",
+  },
+
+  stopButton: {
+    backgroundColor: "#EF4444",
+  },
+
+  controlButtonText: {
+    color: "#FFFFFF",
+    fontSize: 16,
+    fontWeight: "700",
+  },
+
+  hint: {
+    marginTop: 14,
+    fontSize: 12,
+    color: "#9CA3AF",
   },
 
   pingCard: {
@@ -687,11 +1038,6 @@ const styles = StyleSheet.create({
     color: "#FFFFFF",
     fontSize: 24,
     fontWeight: "800",
-  },
-
-  counter: {
-    marginTop: 15,
-    color: "#6B7280",
   },
 
   deviceRow: {
