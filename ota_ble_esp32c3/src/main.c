@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -27,10 +28,37 @@
  * CHANGE THIS FOR EACH FIRMWARE VERSION
  * ============================================================ */
 
-#define APP_MESSAGE "Vanakam_da_mapla"
+#define APP_MESSAGE "Changed the frimware"
 
 
 static const char *TAG = "BLE_OTA";
+
+
+/* ============================================================
+ * APPLICATION MODE
+ * ============================================================ */
+
+typedef enum
+{
+    APP_MODE_NORMAL = 0,
+    APP_MODE_OTA
+
+} app_mode_t;
+
+
+/*
+ * Current operating mode.
+ *
+ * NORMAL:
+ *      Normal application is running.
+ *
+ * OTA:
+ *      Normal application activity is paused.
+ *      Only OTA related BLE operations are processed.
+ */
+
+static volatile app_mode_t app_mode =
+    APP_MODE_NORMAL;
 
 
 /* ============================================================
@@ -88,11 +116,15 @@ static const ble_uuid128_t status_uuid =
 
 static esp_ota_handle_t ota_handle;
 
-static const esp_partition_t *update_partition = NULL;
-
-static bool ota_active = false;
+static const esp_partition_t *update_partition =
+    NULL;
 
 static size_t ota_received = 0;
+
+
+/* ============================================================
+ * BLE STATE
+ * ============================================================ */
 
 static uint16_t connection_handle =
     BLE_HS_CONN_HANDLE_NONE;
@@ -115,8 +147,8 @@ static void notify_text(
 )
 {
     if (connection_handle ==
-        BLE_HS_CONN_HANDLE_NONE) {
-
+        BLE_HS_CONN_HANDLE_NONE)
+    {
         return;
     }
 
@@ -128,8 +160,8 @@ static void notify_text(
         );
 
 
-    if (om == NULL) {
-
+    if (om == NULL)
+    {
         ESP_LOGE(
             TAG,
             "Failed to allocate BLE buffer"
@@ -147,8 +179,8 @@ static void notify_text(
         );
 
 
-    if (rc != 0) {
-
+    if (rc != 0)
+    {
         ESP_LOGE(
             TAG,
             "Notification failed: %d",
@@ -165,37 +197,25 @@ static void notify_text(
 static void ota_start(void)
 {
     /*
-     * If a previous OTA session was interrupted,
-     * abort it before starting a new one.
+     * Do not allow another START while
+     * an OTA session is already active.
      */
 
-    if (ota_active) {
-
+    if (app_mode == APP_MODE_OTA)
+    {
         ESP_LOGW(
             TAG,
-            "Previous OTA session active - aborting"
+            "OTA already active"
         );
 
 
-        esp_err_t abort_err =
-            esp_ota_abort(
-                ota_handle
-            );
+        notify_text(
+            status_handle,
+            "ERROR:ALREADY_STARTED"
+        );
 
 
-        if (abort_err != ESP_OK) {
-
-            ESP_LOGW(
-                TAG,
-                "esp_ota_abort: %s",
-                esp_err_to_name(abort_err)
-            );
-        }
-
-
-        ota_active = false;
-        ota_received = 0;
-        update_partition = NULL;
+        return;
     }
 
 
@@ -210,8 +230,8 @@ static void ota_start(void)
         );
 
 
-    if (update_partition == NULL) {
-
+    if (update_partition == NULL)
+    {
         ESP_LOGE(
             TAG,
             "No OTA partition available"
@@ -236,7 +256,7 @@ static void ota_start(void)
 
 
     /*
-     * Begin writing the new firmware.
+     * Begin OTA write.
      */
 
     esp_err_t err =
@@ -247,13 +267,16 @@ static void ota_start(void)
         );
 
 
-    if (err != ESP_OK) {
-
+    if (err != ESP_OK)
+    {
         ESP_LOGE(
             TAG,
             "esp_ota_begin failed: %s",
             esp_err_to_name(err)
         );
+
+
+        update_partition = NULL;
 
 
         notify_text(
@@ -262,21 +285,40 @@ static void ota_start(void)
         );
 
 
-        update_partition = NULL;
-
-
         return;
     }
 
 
-    ota_active = true;
+    /*
+     * OTA is now officially active.
+     *
+     * From this point onward, normal
+     * application behavior must stop.
+     */
+
+    app_mode = APP_MODE_OTA;
 
     ota_received = 0;
 
 
     ESP_LOGI(
         TAG,
-        "OTA READY"
+        "================================"
+    );
+
+    ESP_LOGI(
+        TAG,
+        "OTA MODE STARTED"
+    );
+
+    ESP_LOGI(
+        TAG,
+        "Normal application paused"
+    );
+
+    ESP_LOGI(
+        TAG,
+        "================================"
     );
 
 
@@ -296,8 +338,12 @@ static void ota_write_data(
     size_t len
 )
 {
-    if (!ota_active) {
+    /*
+     * DATA is only valid during OTA mode.
+     */
 
+    if (app_mode != APP_MODE_OTA)
+    {
         notify_text(
             status_handle,
             "ERROR:NOT_STARTED"
@@ -316,8 +362,8 @@ static void ota_write_data(
         );
 
 
-    if (err != ESP_OK) {
-
+    if (err != ESP_OK)
+    {
         ESP_LOGE(
             TAG,
             "esp_ota_write failed: %s",
@@ -326,7 +372,7 @@ static void ota_write_data(
 
 
         /*
-         * Abort the broken OTA session.
+         * Abort broken OTA session.
          */
 
         esp_ota_abort(
@@ -334,11 +380,17 @@ static void ota_write_data(
         );
 
 
-        ota_active = false;
-
         ota_received = 0;
 
         update_partition = NULL;
+
+        app_mode = APP_MODE_NORMAL;
+
+
+        ESP_LOGW(
+            TAG,
+            "OTA failed - returning to NORMAL mode"
+        );
 
 
         notify_text(
@@ -361,8 +413,12 @@ static void ota_write_data(
 
 static void ota_finish(void)
 {
-    if (!ota_active) {
+    /*
+     * END is only valid while OTA is active.
+     */
 
+    if (app_mode != APP_MODE_OTA)
+    {
         notify_text(
             status_handle,
             "ERROR:NOT_STARTED"
@@ -381,7 +437,8 @@ static void ota_finish(void)
 
 
     /*
-     * Finish writing and validate the image.
+     * Finish writing and validate the
+     * firmware image.
      */
 
     esp_err_t err =
@@ -390,8 +447,8 @@ static void ota_finish(void)
         );
 
 
-    if (err != ESP_OK) {
-
+    if (err != ESP_OK)
+    {
         ESP_LOGE(
             TAG,
             "OTA validation failed: %s",
@@ -399,11 +456,17 @@ static void ota_finish(void)
         );
 
 
-        ota_active = false;
-
         ota_received = 0;
 
         update_partition = NULL;
+
+        app_mode = APP_MODE_NORMAL;
+
+
+        ESP_LOGW(
+            TAG,
+            "Invalid image - returning to NORMAL mode"
+        );
 
 
         notify_text(
@@ -417,8 +480,8 @@ static void ota_finish(void)
 
 
     /*
-     * Mark the newly written partition as
-     * the next boot partition.
+     * Select newly written partition
+     * as the next boot partition.
      */
 
     err =
@@ -427,8 +490,8 @@ static void ota_finish(void)
         );
 
 
-    if (err != ESP_OK) {
-
+    if (err != ESP_OK)
+    {
         ESP_LOGE(
             TAG,
             "Set boot partition failed: %s",
@@ -436,11 +499,17 @@ static void ota_finish(void)
         );
 
 
-        ota_active = false;
-
         ota_received = 0;
 
         update_partition = NULL;
+
+        app_mode = APP_MODE_NORMAL;
+
+
+        ESP_LOGW(
+            TAG,
+            "Boot partition failed - returning to NORMAL mode"
+        );
 
 
         notify_text(
@@ -459,12 +528,29 @@ static void ota_finish(void)
 
     ESP_LOGI(
         TAG,
+        "================================"
+    );
+
+    ESP_LOGI(
+        TAG,
         "OTA SUCCESS"
     );
 
+    ESP_LOGI(
+        TAG,
+        "Next boot: %s",
+        update_partition->label
+    );
 
-    ota_active = false;
+    ESP_LOGI(
+        TAG,
+        "================================"
+    );
 
+
+    /*
+     * Tell the laptop that OTA succeeded.
+     */
 
     notify_text(
         status_handle,
@@ -473,8 +559,8 @@ static void ota_finish(void)
 
 
     /*
-     * Give BLE enough time to transmit
-     * the SUCCESS notification.
+     * Give BLE stack enough time to
+     * transmit SUCCESS notification.
      */
 
     vTaskDelay(
@@ -484,7 +570,7 @@ static void ota_finish(void)
 
     ESP_LOGI(
         TAG,
-        "Restarting..."
+        "Restarting into new firmware..."
     );
 
 
@@ -525,8 +611,8 @@ static int gatt_access_cb(
             );
 
 
-        if (len >= sizeof(command)) {
-
+        if (len >= sizeof(command))
+        {
             return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         }
 
@@ -549,6 +635,10 @@ static int gatt_access_cb(
         );
 
 
+        /*
+         * START OTA
+         */
+
         if (strcmp(
                 command,
                 "START"
@@ -557,6 +647,10 @@ static int gatt_access_cb(
             ota_start();
         }
 
+
+        /*
+         * END OTA
+         */
 
         else if (
             strcmp(
@@ -568,6 +662,10 @@ static int gatt_access_cb(
             ota_finish();
         }
 
+
+        /*
+         * Unknown command
+         */
 
         else
         {
@@ -600,8 +698,8 @@ static int gatt_access_cb(
         uint8_t buffer[256];
 
 
-        if (len > sizeof(buffer)) {
-
+        if (len > sizeof(buffer))
+        {
             return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         }
 
@@ -647,7 +745,10 @@ static const struct ble_gatt_svc_def gatt_services[] =
 
             /*
              * MESSAGE
+             *
              * ESP32 -> Laptop
+             *
+             * Normal application data.
              */
 
             {
@@ -667,7 +768,10 @@ static const struct ble_gatt_svc_def gatt_services[] =
 
             /*
              * CONTROL
+             *
              * Laptop -> ESP32
+             *
+             * START / END
              */
 
             {
@@ -685,7 +789,10 @@ static const struct ble_gatt_svc_def gatt_services[] =
 
             /*
              * DATA
+             *
              * Laptop -> ESP32
+             *
+             * Firmware binary.
              */
 
             {
@@ -703,7 +810,10 @@ static const struct ble_gatt_svc_def gatt_services[] =
 
             /*
              * STATUS
+             *
              * ESP32 -> Laptop
+             *
+             * READY / SUCCESS / ERROR
              */
 
             {
@@ -738,10 +848,23 @@ static void message_task(
     void *arg
 )
 {
-    while (1) {
+    while (1)
+    {
+        /*
+         * Normal application messages are
+         * ONLY sent in NORMAL mode.
+         *
+         * As soon as START is received:
+         *
+         *     NORMAL -> OTA
+         *
+         * this condition becomes false.
+         */
 
         if (connection_handle !=
-            BLE_HS_CONN_HANDLE_NONE)
+                BLE_HS_CONN_HANDLE_NONE &&
+            app_mode ==
+                APP_MODE_NORMAL)
         {
             notify_text(
                 message_handle,
@@ -769,8 +892,12 @@ static int gap_event(
     void *arg
 )
 {
-    switch (event->type) {
+    switch (event->type)
+    {
 
+    /* --------------------------------------------------------
+     * CONNECT
+     * -------------------------------------------------------- */
 
     case BLE_GAP_EVENT_CONNECT:
 
@@ -804,6 +931,10 @@ static int gap_event(
         break;
 
 
+    /* --------------------------------------------------------
+     * DISCONNECT
+     * -------------------------------------------------------- */
+
     case BLE_GAP_EVENT_DISCONNECT:
 
         connection_handle =
@@ -814,6 +945,40 @@ static int gap_event(
             TAG,
             "BLE DISCONNECTED"
         );
+
+
+        /*
+         * If the device disconnects during OTA,
+         * the OTA session is no longer useful.
+         *
+         * Abort it and return to NORMAL mode.
+         */
+
+        if (app_mode == APP_MODE_OTA)
+        {
+            ESP_LOGW(
+                TAG,
+                "BLE disconnected during OTA"
+            );
+
+
+            esp_ota_abort(
+                ota_handle
+            );
+
+
+            ota_received = 0;
+
+            update_partition = NULL;
+
+            app_mode = APP_MODE_NORMAL;
+
+
+            ESP_LOGW(
+                TAG,
+                "OTA aborted - NORMAL mode restored"
+            );
+        }
 
 
         start_advertising();
@@ -874,8 +1039,8 @@ static void start_advertising(void)
         );
 
 
-    if (rc != 0) {
-
+    if (rc != 0)
+    {
         ESP_LOGE(
             TAG,
             "Advertising setup failed: %d",
@@ -907,7 +1072,7 @@ static void start_advertising(void)
 
     /*
      * NimBLE GAP event callback is supplied
-     * here, not through ble_hs_cfg.
+     * directly to ble_gap_adv_start().
      */
 
     rc =
@@ -921,8 +1086,8 @@ static void start_advertising(void)
         );
 
 
-    if (rc != 0) {
-
+    if (rc != 0)
+    {
         ESP_LOGE(
             TAG,
             "Advertising failed: %d",
@@ -1009,6 +1174,12 @@ void app_main(void)
 
     ESP_LOGI(
         TAG,
+        "       MODE: NORMAL"
+    );
+
+
+    ESP_LOGI(
+        TAG,
         "=============================="
     );
 
@@ -1074,8 +1245,8 @@ void app_main(void)
         );
 
 
-    if (rc != 0) {
-
+    if (rc != 0)
+    {
         ESP_LOGE(
             TAG,
             "GATT count failed: %d",
@@ -1093,8 +1264,8 @@ void app_main(void)
         );
 
 
-    if (rc != 0) {
-
+    if (rc != 0)
+    {
         ESP_LOGE(
             TAG,
             "GATT add failed: %d",
