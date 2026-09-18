@@ -3,5 +3,7 @@
     "source.fixAll": "explicit",
     "source.organizeImports": "explicit",
     "source.sortMembers": "explicit"
-  }
+  },
+  "cmake.sourceDirectory": "/home/bharath/Documents/gcg/bluetooth/ota_ble_esp32c3",
+  "cmake.autoDetectSourceDirectory": false
 }
